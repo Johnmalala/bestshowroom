@@ -4,7 +4,9 @@ import { useAuth } from '../hooks/useAuth'
 import { formatKES } from '../utils/currency'
 import { Car, TrendingUp, DollarSign, Clock, ArrowUp, ArrowDown, Download } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts'
-import { format } from 'date-fns'
+import { format, startOfMonth, endOfMonth, subMonths } from 'date-fns'
+import { exportToCSV } from '../utils/export'
+import toast from 'react-hot-toast'
 
 interface DashboardStats {
   totalCars: number
@@ -14,6 +16,8 @@ interface DashboardStats {
   salesByMonth: { month: string; sales: number }[]
   carStatusData: { name: string; value: number }[]
   recentPayments: any[]
+  salesChange: number
+  soldCarsChange: number
 }
 
 interface StatCardProps {
@@ -25,7 +29,7 @@ interface StatCardProps {
 }
 
 const StatCard: React.FC<StatCardProps> = ({ icon: Icon, title, value, change, iconColor }) => {
-  const isPositive = change && change >= 0;
+  const isPositive = change !== undefined && change >= 0;
   return (
     <div className="bg-white p-6 rounded-xl shadow-sm flex items-start justify-between">
       <div>
@@ -39,7 +43,7 @@ const StatCard: React.FC<StatCardProps> = ({ icon: Icon, title, value, change, i
               <ArrowDown className="w-4 h-4 text-red-500" />
             )}
             <span className={`ml-1 font-semibold ${isPositive ? 'text-green-500' : 'text-red-500'}`}>
-              {Math.abs(change)}%
+              {Math.abs(change).toFixed(1)}%
             </span>
             <span className="ml-1 text-gray-500">vs last month</span>
           </div>
@@ -64,9 +68,32 @@ export const Dashboard: React.FC = () => {
   const fetchDashboardData = async () => {
     try {
       setLoading(true)
-      const { data: cars } = await supabase.from('cars').select('id, status, purchase_price')
+
+      const now = new Date();
+      const currentMonthStart = startOfMonth(now);
+      const currentMonthEnd = endOfMonth(now);
+      const prevMonthStart = startOfMonth(subMonths(now, 1));
+      const prevMonthEnd = endOfMonth(subMonths(now, 1));
+
+      // General stats
+      const { data: cars } = await supabase.from('cars').select('id, status, purchase_price, updated_at')
       const { data: customers } = await supabase.from('customers').select('remaining_balance')
-      const { data: payments } = await supabase.from('payments').select('id, amount, payment_date, payment_type, customer:customers(full_name)').order('created_at', { ascending: false }).limit(5)
+      const { data: recentPayments } = await supabase.from('payments').select('id, amount, payment_date, payment_type, customer:customers(full_name)').order('created_at', { ascending: false }).limit(5)
+
+      // Current month stats
+      const { data: currentMonthPayments } = await supabase.from('payments').select('amount').gte('payment_date', currentMonthStart.toISOString()).lte('payment_date', currentMonthEnd.toISOString());
+      const currentMonthSales = currentMonthPayments?.reduce((sum, p) => sum + p.amount, 0) || 0;
+      const currentMonthSoldCarsCount = cars?.filter(c => c.status === 'sold' && new Date(c.updated_at) >= currentMonthStart && new Date(c.updated_at) <= currentMonthEnd).length || 0;
+
+      // Previous month stats
+      const { data: prevMonthPayments } = await supabase.from('payments').select('amount').gte('payment_date', prevMonthStart.toISOString()).lte('payment_date', prevMonthEnd.toISOString());
+      const prevMonthSales = prevMonthPayments?.reduce((sum, p) => sum + p.amount, 0) || 0;
+      const prevMonthSoldCarsCount = cars?.filter(c => c.status === 'sold' && new Date(c.updated_at) >= prevMonthStart && new Date(c.updated_at) <= prevMonthEnd).length || 0;
+      
+      // Calculate percentage changes
+      const salesChange = prevMonthSales > 0 ? ((currentMonthSales - prevMonthSales) / prevMonthSales) * 100 : (currentMonthSales > 0 ? 100 : 0);
+      const soldCarsChange = prevMonthSoldCarsCount > 0 ? ((currentMonthSoldCarsCount - prevMonthSoldCarsCount) / prevMonthSoldCarsCount) * 100 : (currentMonthSoldCarsCount > 0 ? 100 : 0);
+
 
       const totalCars = cars?.length || 0
       const soldCars = cars?.filter(c => c.status === 'sold').length || 0
@@ -75,7 +102,8 @@ export const Dashboard: React.FC = () => {
       const totalSales = cars?.filter(c => c.status === 'sold').reduce((sum, car) => sum + car.purchase_price, 0) || 0
       const totalOutstanding = customers?.reduce((sum, cust) => sum + cust.remaining_balance, 0) || 0
 
-      const salesByMonth = (await supabase.from('payments').select('amount, payment_date')).data?.reduce((acc: any, p: any) => {
+      const { data: allPayments } = await supabase.from('payments').select('amount, payment_date');
+      const salesByMonth = allPayments?.reduce((acc: any, p: any) => {
         const month = format(new Date(p.payment_date), 'MMM');
         acc[month] = (acc[month] || 0) + p.amount;
         return acc;
@@ -94,14 +122,30 @@ export const Dashboard: React.FC = () => {
           { name: 'Available', value: availableCars },
           { name: 'Sold', value: soldCars },
         ],
-        recentPayments: payments || []
+        recentPayments: recentPayments || [],
+        salesChange,
+        soldCarsChange
       })
     } catch (error) {
       console.error('Error fetching dashboard data:', error)
+      toast.error("Failed to load dashboard data.")
     } finally {
       setLoading(false)
     }
   }
+  
+  const handleDownloadReport = () => {
+    if (!stats) return;
+    const summaryData = [
+      { Metric: "Total Revenue", Value: formatKES(stats.totalSales) },
+      { Metric: "Cars Sold", Value: stats.soldCars },
+      { Metric: "Pending Balance", Value: formatKES(stats.totalOutstanding) },
+      { Metric: "Total Cars in Inventory", Value: stats.totalCars },
+    ];
+    exportToCSV(summaryData, `dashboard-summary-${new Date().toISOString().split('T')[0]}`);
+    toast.success("Dashboard summary report downloaded.");
+  }
+
 
   if (loading || !stats) {
     return (
@@ -121,6 +165,7 @@ export const Dashboard: React.FC = () => {
           <p className="mt-2 text-gray-600">Here’s a summary of your showroom's performance.</p>
         </div>
         <button
+          onClick={handleDownloadReport}
           className="inline-flex items-center justify-center gap-2 px-4 py-2 border border-transparent rounded-lg shadow-sm text-sm font-medium text-white bg-brand-accent hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 transition-colors"
         >
           <Download className="h-4 w-4" />
@@ -129,9 +174,9 @@ export const Dashboard: React.FC = () => {
       </header>
 
       <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-4">
-        <StatCard icon={DollarSign} title="Total Revenue" value={formatKES(stats.totalSales)} change={5.2} iconColor="text-green-500" />
-        <StatCard icon={TrendingUp} title="Cars Sold" value={stats.soldCars.toString()} change={12.5} iconColor="text-blue-500" />
-        <StatCard icon={Clock} title="Pending Balance" value={formatKES(stats.totalOutstanding)} change={-2.1} iconColor="text-yellow-500" />
+        <StatCard icon={DollarSign} title="Total Revenue" value={formatKES(stats.totalSales)} change={stats.salesChange} iconColor="text-green-500" />
+        <StatCard icon={TrendingUp} title="Cars Sold" value={stats.soldCars.toString()} change={stats.soldCarsChange} iconColor="text-blue-500" />
+        <StatCard icon={Clock} title="Pending Balance" value={formatKES(stats.totalOutstanding)} iconColor="text-yellow-500" />
         <StatCard icon={Car} title="Total Cars" value={stats.totalCars.toString()} iconColor="text-purple-500" />
       </div>
 

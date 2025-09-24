@@ -1,9 +1,14 @@
-import React, { useState, useEffect } from 'react'
-import { supabase } from '../lib/supabase'
+import React, { useState, useEffect, useMemo } from 'react'
+import { supabase, Car, Customer, BrokerCommission, Payment } from '../lib/supabase'
 import { useAuth } from '../hooks/useAuth'
 import { formatKES } from '../utils/currency'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from 'recharts'
-import { Download, FileText, TrendingUp, Calendar } from 'lucide-react'
+import { Download, Calendar } from 'lucide-react'
+import { exportToCSV } from '../utils/export'
+import toast from 'react-hot-toast'
+import { DataTable } from '../components/ui/DataTable'
+import { ColumnDef } from '@tanstack/react-table'
+import { format } from 'date-fns'
 
 interface ReportData {
   carsSold: any[]
@@ -32,63 +37,43 @@ export const Reports: React.FC = () => {
 
   useEffect(() => {
     fetchReportData()
-  }, [dateRange])
+  }, [dateRange, isOwner])
 
   const fetchReportData = async () => {
     try {
       setLoading(true)
 
-      // Fetch cars sold
       const { data: carsSold } = await supabase
         .from('cars')
-        .select(`
-          *,
-          broker:brokers(name),
-          customers:customers(full_name, deposit_paid, remaining_balance)
-        `)
+        .select(`*, broker:brokers(name), customer:customers(full_name)`)
         .eq('status', 'sold')
+        .gte('updated_at', dateRange.from)
+        .lte('updated_at', dateRange.to)
 
-      // Fetch hire purchase summary
       const { data: hirePurchase } = await supabase
         .from('customers')
-        .select(`
-          *,
-          car:cars(car_type, model_number, registration_number, purchase_price)
-        `)
+        .select(`*, car:cars(car_type, model_number, registration_number, purchase_price)`)
         .not('hire_purchase_start_date', 'is', null)
 
-      // Fetch broker commissions (owner only)
-      let brokerCommissions = []
+      let brokerCommissions: any[] = []
       if (isOwner) {
         const { data: commissions } = await supabase
           .from('broker_commissions')
-          .select(`
-            *,
-            broker:brokers(name),
-            car:cars(car_type, model_number, registration_number)
-          `)
+          .select(`*, broker:brokers(name), car:cars(car_type, model_number, registration_number)`)
+          .gte('created_at', dateRange.from)
+          .lte('created_at', dateRange.to)
         brokerCommissions = commissions || []
       }
 
-      // Fetch payments history
       const { data: payments } = await supabase
         .from('payments')
-        .select(`
-          *,
-          customer:customers(full_name),
-          car:cars(car_type, model_number),
-          staff:staff_profiles(full_name)
-        `)
+        .select(`*, customer:customers(full_name), car:cars(car_type, model_number), staff:staff_profiles(full_name)`)
         .gte('payment_date', dateRange.from)
         .lte('payment_date', dateRange.to)
         .order('payment_date', { ascending: false })
 
-      // Process sales by month
       const salesByMonth = payments?.reduce((acc: any[], payment: any) => {
-        const month = new Date(payment.payment_date).toLocaleDateString('en-US', { 
-          year: 'numeric', 
-          month: 'short' 
-        })
+        const month = new Date(payment.payment_date).toLocaleDateString('en-US', { year: 'numeric', month: 'short' })
         const existing = acc.find(item => item.month === month)
         if (existing) {
           existing.amount += payment.amount
@@ -98,16 +83,13 @@ export const Reports: React.FC = () => {
         return acc
       }, []) || []
 
-      // Car status data for pie chart
-      const totalCars = carsSold?.length || 0
-      const availableCars = await supabase
-        .from('cars')
-        .select('id')
-        .eq('status', 'available')
+      const { data: allCars } = await supabase.from('cars').select('id, status')
+      const totalSold = allCars?.filter(c => c.status === 'sold').length || 0
+      const totalAvailable = allCars?.filter(c => c.status === 'available').length || 0
       
       const carStatusData = [
-        { name: 'Available', value: availableCars.data?.length || 0, color: '#10B981' },
-        { name: 'Sold', value: totalCars, color: '#EF4444' }
+        { name: 'Available', value: totalAvailable, color: '#3B82F6' },
+        { name: 'Sold', value: totalSold, color: '#10B981' }
       ]
 
       setReportData({
@@ -120,30 +102,54 @@ export const Reports: React.FC = () => {
       })
     } catch (error) {
       console.error('Error fetching report data:', error)
+      toast.error("Failed to load report data.")
     } finally {
       setLoading(false)
     }
   }
 
-  const exportToCSV = (data: any[], filename: string) => {
-    if (data.length === 0) return
-
-    const headers = Object.keys(data[0]).join(',')
-    const rows = data.map(item => 
-      Object.values(item).map(val => 
-        typeof val === 'object' ? JSON.stringify(val) : val
-      ).join(',')
-    ).join('\n')
-    
-    const csv = `${headers}\n${rows}`
-    const blob = new Blob([csv], { type: 'text/csv' })
-    const url = window.URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `${filename}.csv`
-    a.click()
-    window.URL.revokeObjectURL(url)
+  const handleExport = (data: any[], filename: string) => {
+    if (data.length === 0) {
+      toast.error("No data available to export.");
+      return;
+    }
+    exportToCSV(data, filename);
+    toast.success(`${filename}.csv has been downloaded.`);
   }
+
+  const carsSoldColumns = useMemo<ColumnDef<Car>[]>(() => [
+    { header: 'Car', cell: ({ row }) => `${row.original.car_type} ${row.original.model_number}` },
+    { accessorKey: 'registration_number', header: 'Reg No.' },
+    { header: 'Sold To', cell: ({ row }) => (row.original as any).customer?.full_name || 'N/A' },
+    { header: 'Price', cell: ({ row }) => formatKES(row.original.purchase_price) },
+    { header: 'Broker', cell: ({ row }) => (row.original as any).broker?.name || 'N/A' },
+    { header: 'Date Sold', cell: ({ row }) => format(new Date(row.original.updated_at), 'PP') },
+  ], []);
+
+  const hirePurchaseColumns = useMemo<ColumnDef<Customer>[]>(() => [
+    { accessorKey: 'full_name', header: 'Customer' },
+    { header: 'Car', cell: ({ row }) => `${(row.original as any).car?.car_type} ${(row.original as any).car?.model_number}` },
+    { header: 'Total Price', cell: ({ row }) => formatKES((row.original as any).car?.purchase_price || 0) },
+    { header: 'Paid', cell: ({ row }) => formatKES(row.original.deposit_paid) },
+    { header: 'Balance', cell: ({ row }) => formatKES(row.original.remaining_balance) },
+    { header: 'Start Date', cell: ({ row }) => row.original.hire_purchase_start_date ? format(new Date(row.original.hire_purchase_start_date), 'PP') : 'N/A' },
+  ], []);
+
+  const brokerCommissionsColumns = useMemo<ColumnDef<BrokerCommission>[]>(() => [
+    { header: 'Broker', cell: ({ row }) => (row.original as any).broker?.name },
+    { header: 'Car', cell: ({ row }) => `${(row.original as any).car?.car_type} ${(row.original as any).car?.registration_number}` },
+    { header: 'Amount', cell: ({ row }) => formatKES(row.original.commission_amount) },
+    { header: 'Status', cell: ({ row }) => row.original.is_paid ? 'Paid' : 'Pending' },
+    { header: 'Paid Date', cell: ({ row }) => row.original.paid_date ? format(new Date(row.original.paid_date), 'PP') : 'N/A' },
+  ], []);
+
+  const paymentsHistoryColumns = useMemo<ColumnDef<Payment>[]>(() => [
+    { header: 'Customer', cell: ({ row }) => (row.original as any).customer?.full_name },
+    { header: 'Amount', cell: ({ row }) => formatKES(row.original.amount) },
+    { header: 'Type', cell: ({ row }) => row.original.payment_type.replace(/_/g, ' ') },
+    { header: 'Date', cell: ({ row }) => format(new Date(row.original.payment_date), 'PP') },
+    { header: 'Received By', cell: ({ row }) => (row.original as any).staff?.full_name || 'N/A' },
+  ], []);
 
   if (loading) {
     return (
@@ -152,356 +158,94 @@ export const Reports: React.FC = () => {
       </div>
     )
   }
+  
+  const reports = [
+    { title: "Cars Sold Report", data: reportData.carsSold, columns: carsSoldColumns, filename: "cars-sold" },
+    { title: "Hire Purchase Summary", data: reportData.hirePurchaseSummary, columns: hirePurchaseColumns, filename: "hire-purchase" },
+    ...(isOwner ? [{ title: "Broker Commissions Report", data: reportData.brokerCommissions, columns: brokerCommissionsColumns, filename: "broker-commissions" }] : []),
+    { title: "Payments History", data: reportData.paymentsHistory, columns: paymentsHistoryColumns, filename: "payments-history" }
+  ];
 
   return (
-    <div className="space-y-6">
-      <div className="sm:flex sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-bold text-gray-900">Reports</h1>
-          <p className="mt-1 text-sm text-gray-500">
-            Comprehensive business analytics and reports
-          </p>
-        </div>
-      </div>
+    <div className="space-y-8">
+      <header>
+        <h1 className="text-3xl font-bold text-gray-900">Reports</h1>
+        <p className="mt-2 text-sm text-gray-500">
+          Comprehensive business analytics and reports.
+        </p>
+      </header>
 
-      {/* Date Range Filter */}
-      <div className="bg-white p-4 rounded-lg shadow">
+      <div className="bg-white p-4 rounded-xl shadow-sm">
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-2">
-            <Calendar className="h-5 w-5 text-gray-400" />
-            <span className="text-sm font-medium text-gray-700">Date Range:</span>
+            <Calendar className="h-5 w-5 text-gray-500" />
+            <span className="text-sm font-medium text-gray-700">Filter by Date Range:</span>
           </div>
           <input
             type="date"
             value={dateRange.from}
             onChange={(e) => setDateRange(prev => ({ ...prev, from: e.target.value }))}
-            className="border border-gray-300 rounded px-3 py-1 text-sm"
+            className="border-gray-300 rounded-md shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
           />
           <span className="text-gray-500">to</span>
           <input
             type="date"
             value={dateRange.to}
             onChange={(e) => setDateRange(prev => ({ ...prev, to: e.target.value }))}
-            className="border border-gray-300 rounded px-3 py-1 text-sm"
+            className="border-gray-300 rounded-md shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm"
           />
         </div>
       </div>
 
-      {/* Charts */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Sales by Month */}
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">Sales by Month</h3>
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        <div className="bg-white p-6 rounded-xl shadow-sm">
+          <h3 className="text-lg font-semibold text-gray-900 mb-4">Sales Over Time</h3>
           <ResponsiveContainer width="100%" height={300}>
             <BarChart data={reportData.salesByMonth}>
-              <CartesianGrid strokeDasharray="3 3" />
-              <XAxis dataKey="month" />
-              <YAxis tickFormatter={(value) => formatKES(value)} />
-              <Tooltip formatter={(value) => [formatKES(Number(value)), 'Sales']} />
-              <Bar dataKey="amount" fill="#3B82F6" />
+              <CartesianGrid strokeDasharray="3 3" vertical={false} />
+              <XAxis dataKey="month" fontSize={12} tickLine={false} axisLine={false} />
+              <YAxis fontSize={12} tickLine={false} axisLine={false} tickFormatter={(value) => formatKES(value)} />
+              <Tooltip formatter={(value) => [formatKES(Number(value)), 'Sales']} contentStyle={{ background: 'white', border: '1px solid #e2e8f0', borderRadius: '0.5rem' }} />
+              <Bar dataKey="amount" fill="#3B82F6" radius={[4, 4, 0, 0]} />
             </BarChart>
           </ResponsiveContainer>
         </div>
 
-        {/* Car Status Distribution */}
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h3 className="text-lg font-medium text-gray-900 mb-4">Car Inventory Status</h3>
+        <div className="bg-white p-6 rounded-xl shadow-sm">
+          <h3 className="text-lg font-semibold text-gray-900 mb-4">Inventory Status</h3>
           <ResponsiveContainer width="100%" height={300}>
             <PieChart>
-              <Pie
-                data={reportData.carStatusData}
-                cx="50%"
-                cy="50%"
-                outerRadius={100}
-                fill="#8884d8"
-                dataKey="value"
-                label={({ name, value }) => `${name}: ${value}`}
-              >
+              <Pie data={reportData.carStatusData} cx="50%" cy="50%" outerRadius={100} dataKey="value" label={({ name, percent }) => `${name} ${(percent * 100).toFixed(0)}%`}>
                 {reportData.carStatusData.map((entry, index) => (
                   <Cell key={`cell-${index}`} fill={entry.color} />
                 ))}
               </Pie>
-              <Tooltip />
+              <Tooltip formatter={(value, name) => [value, name]} />
+              <Legend iconType="circle" />
             </PieChart>
           </ResponsiveContainer>
         </div>
       </div>
 
-      {/* Reports Tables */}
-      <div className="grid grid-cols-1 gap-6">
-        {/* Cars Sold Report */}
-        <div className="bg-white shadow overflow-hidden sm:rounded-md">
-          <div className="px-4 py-5 sm:p-6">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg leading-6 font-medium text-gray-900">
-                Cars Sold Report
-              </h3>
+      <div className="space-y-8">
+        {reports.map(report => (
+          <div key={report.title} className="bg-white shadow-sm rounded-xl p-4 sm:p-6">
+            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center mb-4 gap-4">
+              <h3 className="text-xl leading-6 font-semibold text-gray-900">{report.title}</h3>
               <button
-                onClick={() => exportToCSV(reportData.carsSold, 'cars-sold-report')}
-                className="inline-flex items-center px-3 py-2 border border-gray-300 shadow-sm text-sm leading-4 font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
+                onClick={() => handleExport(report.data, `${report.filename}-report-${dateRange.to}`)}
+                className="inline-flex items-center gap-2 px-3 py-2 border border-gray-300 shadow-sm text-sm font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
               >
-                <Download className="h-4 w-4 mr-2" />
-                Export CSV
+                <Download className="h-4 w-4" /> Export CSV
               </button>
             </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Car Details
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Purchase Price
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Customer
-                    </th>
-                    {isOwner && (
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Broker
-                      </th>
-                    )}
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {reportData.carsSold.map((car) => (
-                    <tr key={car.id}>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm font-medium text-gray-900">
-                          {car.car_type} - {car.model_number}
-                        </div>
-                        <div className="text-sm text-gray-500">{car.registration_number}</div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatKES(car.purchase_price)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {car.customers?.[0]?.full_name || 'N/A'}
-                      </td>
-                      {isOwner && (
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                          {car.broker?.name || 'No broker'}
-                        </td>
-                      )}
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            {report.data.length > 0 ? (
+              <DataTable columns={report.columns} data={report.data} />
+            ) : (
+              <p className="text-center text-gray-500 py-10">No data available for this report in the selected date range.</p>
+            )}
           </div>
-        </div>
-
-        {/* Hire Purchase Summary */}
-        <div className="bg-white shadow overflow-hidden sm:rounded-md">
-          <div className="px-4 py-5 sm:p-6">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg leading-6 font-medium text-gray-900">
-                Hire Purchase Summary
-              </h3>
-              <button
-                onClick={() => exportToCSV(reportData.hirePurchaseSummary, 'hire-purchase-summary')}
-                className="inline-flex items-center px-3 py-2 border border-gray-300 shadow-sm text-sm leading-4 font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
-              >
-                <Download className="h-4 w-4 mr-2" />
-                Export CSV
-              </button>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Customer
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Car
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Total Price
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Amount Paid
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Remaining
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {reportData.hirePurchaseSummary.map((customer) => (
-                    <tr key={customer.id}>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <div className="text-sm font-medium text-gray-900">
-                          {customer.full_name}
-                        </div>
-                        <div className="text-sm text-gray-500">{customer.phone_number}</div>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        {customer.car ? (
-                          <div className="text-sm text-gray-900">
-                            <div>{customer.car.car_type} - {customer.car.model_number}</div>
-                            <div className="text-gray-500">{customer.car.registration_number}</div>
-                          </div>
-                        ) : (
-                          <span className="text-gray-500">No car assigned</span>
-                        )}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {customer.car ? formatKES(customer.car.purchase_price) : 'N/A'}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatKES(customer.deposit_paid)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                        {formatKES(customer.remaining_balance)}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-
-        {/* Broker Commissions (Owner Only) */}
-        {isOwner && (
-          <div className="bg-white shadow overflow-hidden sm:rounded-md">
-            <div className="px-4 py-5 sm:p-6">
-              <div className="flex justify-between items-center mb-4">
-                <h3 className="text-lg leading-6 font-medium text-gray-900">
-                  Broker Commissions Report
-                </h3>
-                <button
-                  onClick={() => exportToCSV(reportData.brokerCommissions, 'broker-commissions-report')}
-                  className="inline-flex items-center px-3 py-2 border border-gray-300 shadow-sm text-sm leading-4 font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
-                >
-                  <Download className="h-4 w-4 mr-2" />
-                  Export CSV
-                </button>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-gray-200">
-                  <thead className="bg-gray-50">
-                    <tr>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Broker
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Car
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Commission
-                      </th>
-                      <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                        Status
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody className="bg-white divide-y divide-gray-200">
-                    {reportData.brokerCommissions.map((commission) => (
-                      <tr key={commission.id}>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                          {commission.broker?.name}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
-                          {commission.car && (
-                            <div className="text-sm text-gray-900">
-                              <div>{commission.car.car_type} - {commission.car.model_number}</div>
-                              <div className="text-gray-500">{commission.car.registration_number}</div>
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
-                          {formatKES(commission.commission_amount)}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
-                          <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                            commission.is_paid 
-                              ? 'bg-green-100 text-green-800'
-                              : 'bg-red-100 text-red-800'
-                          }`}>
-                            {commission.is_paid ? 'Paid' : 'Pending'}
-                          </span>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Payments History */}
-        <div className="bg-white shadow overflow-hidden sm:rounded-md">
-          <div className="px-4 py-5 sm:p-6">
-            <div className="flex justify-between items-center mb-4">
-              <h3 className="text-lg leading-6 font-medium text-gray-900">
-                Payments History
-              </h3>
-              <button
-                onClick={() => exportToCSV(reportData.paymentsHistory, 'payments-history-report')}
-                className="inline-flex items-center px-3 py-2 border border-gray-300 shadow-sm text-sm leading-4 font-medium rounded-md text-gray-700 bg-white hover:bg-gray-50"
-              >
-                <Download className="h-4 w-4 mr-2" />
-                Export CSV
-              </button>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="min-w-full divide-y divide-gray-200">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Date
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Customer
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Payment Type
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Amount
-                    </th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Received By
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className="bg-white divide-y divide-gray-200">
-                  {reportData.paymentsHistory.map((payment) => (
-                    <tr key={payment.id}>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {new Date(payment.payment_date).toLocaleDateString()}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        {payment.customer?.full_name}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
-                        <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
-                          payment.payment_type === 'full_purchase' 
-                            ? 'bg-green-100 text-green-800'
-                            : payment.payment_type === 'hire_purchase_deposit'
-                            ? 'bg-blue-100 text-blue-800'
-                            : 'bg-yellow-100 text-yellow-800'
-                        }`}>
-                          {payment.payment_type.replace(/_/g, ' ')}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
-                        {formatKES(payment.amount)}
-                      </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                        {payment.staff?.full_name || 'Not specified'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </div>
-        </div>
+        ))}
       </div>
     </div>
   )

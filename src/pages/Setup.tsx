@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase } from '../lib/supabase'
 import { Building } from 'lucide-react'
+import toast from 'react-hot-toast'
 
 export const Setup: React.FC = () => {
   const [formData, setFormData] = useState({
@@ -11,13 +12,12 @@ export const Setup: React.FC = () => {
     phone_number: ''
   })
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
   const navigate = useNavigate()
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setLoading(true)
-    setError('')
+    const toastId = toast.loading('Creating owner account...');
 
     try {
       const { data: { user }, error: signUpError } = await supabase.auth.signUp({
@@ -36,11 +36,17 @@ export const Setup: React.FC = () => {
       if (signUpError) throw signUpError
       if (!user) throw new Error("Sign up failed, please try again.")
       
-      alert('Setup complete! Please check your email to verify your account. The page will now reload.')
-      window.location.reload()
+      toast.success('Setup complete! Please check your email to verify your account. The page will now reload.', {
+        id: toastId,
+        duration: 5000,
+      });
+
+      setTimeout(() => {
+        window.location.reload();
+      }, 5000);
 
     } catch (error: any) {
-      setError(error.message)
+      toast.error(error.message, { id: toastId });
     } finally {
       setLoading(false)
     }
@@ -102,12 +108,6 @@ export const Setup: React.FC = () => {
               onChange={(e) => setFormData(p => ({...p, password: e.target.value}))}
             />
           </div>
-
-          {error && (
-            <div className="rounded-md bg-red-50 p-4">
-              <div className="text-sm text-red-700">{error}</div>
-            </div>
-          )}
 
           <div>
             <button
